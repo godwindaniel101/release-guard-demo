@@ -1,0 +1,83 @@
+# Guard 1 — the promotion path.
+#
+# `main` accepts a pull request from `dev`, or from a branch with the name
+# `hotfix/<description>`. The check fails for each other source branch.
+#
+# The check makes the merge button unavailable only when branch protection makes it a
+# required check. Run `scripts/apply-branch-protection.sh` to do this. Without that
+# setting, the check is advisory and a person can merge past it.
+#
+# Do not change the `name:` of the job below on its own. Branch protection holds that
+# text as the required status check. If one text changes and the other text does not, the
+# check stays pending, and each merge into `main` stops.
+#
+# Two names cannot both be required during a rename. A required check that no job reports
+# stays pending, so a list of the old name and the new name blocks each pull request:
+# one of the two names is always absent. Change the required name to the new name in the
+# same step in which the promotion carries the new job name.
+
+name: PR source guard
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  verify-source-branch:
+    name: main promotion source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the source branch of the pull request
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          echo "  base : $BASE_REF"
+          echo "  head : $HEAD_REF"
+
+          if [ "$HEAD_REF" = "dev" ]; then
+            echo "::notice::The source branch is dev. The merge is permitted."
+            exit 0
+          fi
+
+          case "$HEAD_REF" in
+            hotfix/*)
+              echo "::notice::The source branch is '$HEAD_REF'. The hotfix merge is permitted."
+              {
+                echo "## The hotfix merge is permitted"
+                echo ""
+                echo "You can merge \`$HEAD_REF\` into \`main\`."
+                echo ""
+                echo "**Necessary next step:** merge \`main\` back into \`dev\` after the release."
+                echo "If you do not, the next merge from \`dev\` into \`main\` removes this fix."
+                echo "See rule P-2."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+              ;;
+          esac
+
+          echo "::error::You cannot merge '$HEAD_REF' into main."
+          {
+            echo "## The PR source guard failed. The merge button is blocked."
+            echo ""
+            echo "\`main\` accepts \`dev\` and \`hotfix/*\` only."
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Source branch | \`$HEAD_REF\` |"
+            echo "| Target branch | \`$BASE_REF\` |"
+            echo ""
+            echo "**To move this work forward:** open a pull request into \`dev\`. Then merge"
+            echo "\`dev\` into \`main\` after you integrate and verify the work."
+            echo ""
+            echo "**If this is a production hotfix:** give the branch the name"
+            echo "\`hotfix/<description>\`. Then merge \`main\` back into \`dev\` after the release."
+            echo ""
+            echo "See \`docs/BRANCH_RELEASE_STANDARD.md\`, rule P-1."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1

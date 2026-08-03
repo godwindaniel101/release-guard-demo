@@ -1,0 +1,153 @@
+# Guard 3 — the release. This is the only workflow that a tag starts.
+#
+# One trigger, one run. Three jobs:
+#   guard   confirms that the tag is on the `main` branch
+#   revoke  runs only when the guard fails. It deletes the tag and the release, and it
+#           opens an issue.
+#   deploy  runs only when the guard passes
+#
+# The guard is a separate job, and deploy depends on it. The guard is not a step inside
+# deploy. A person can edit a job to stop the checks on its own conditions. A person
+# cannot bypass a dependency without a change to the workflow graph, and that change is
+# visible in the diff.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # required to delete an invalid tag and release
+  issues: write
+
+jobs:
+  guard:
+    name: validating deployment source
+    runs-on: ubuntu-latest
+    outputs:
+      # The script writes `reason=` to the step output when it refuses. The `revoke` job
+      # reads it, so the issue names the check that refused the tag.
+      reason: ${{ steps.verify.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the guard cannot read the history on a shallow clone
+
+      - name: Check the tag
+        id: verify
+        run: |
+          chmod +x scripts/verify-tag-source.sh
+          scripts/verify-tag-source.sh "${{ github.ref_name }}" main
+
+  revoke:
+    name: revoke invalid release
+    needs: guard
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the guard runs again here to read the reason
+
+      # A job output from a failed job is not dependable, so this step runs the guard
+      # again and reads the reason from its own output file. The guard makes no change,
+      # so a second run is safe.
+      - name: Read the reason that the guard refused the tag
+        id: reason
+        run: |
+          chmod +x scripts/verify-tag-source.sh
+          set +e
+          GITHUB_OUTPUT=guard-reason.txt scripts/verify-tag-source.sh "${{ github.ref_name }}" main
+          set -e
+          FROM_GUARD=$(sed -n 's/^reason=//p' guard-reason.txt 2>/dev/null | tail -1)
+          FROM_JOB="${{ needs.guard.outputs.reason }}"
+          REASON="${FROM_GUARD:-${FROM_JOB:-the guard refused the tag}}"
+          echo "text=$REASON" >> "$GITHUB_OUTPUT"
+          echo "reason: $REASON"
+
+      - name: Delete the release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          echo "Guard refused $TAG. Revoking."
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes && echo "  release deleted"
+          else
+            echo "  no release object"
+          fi
+
+          if gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$TAG" 2>/dev/null; then
+            echo "  tag deleted"
+          else
+            echo "  tag already absent"
+          fi
+
+          {
+            echo "## The release is revoked"
+            echo ""
+            echo "**Reason:** ${{ steps.reason.outputs.text }}"
+            echo ""
+            echo "The tag \`$TAG\` and its release object are deleted, and no deployment ran."
+            echo ""
+            echo "Cut each release tag on \`main\`, annotated, with the form vMAJOR.MINOR.PATCH:"
+            echo ""
+            echo "    git checkout main && git pull"
+            echo "    git tag -a $TAG -m 'release $TAG'"
+            echo "    git push origin $TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Raise an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REASON: ${{ steps.reason.outputs.text }}
+        run: |
+          gh issue create \
+            --title "Release revoked: $TAG — $REASON" \
+            --body "The guard refused the tag \`$TAG\` (\`${{ github.sha }}\`).
+
+          **Reason:** $REASON
+
+          @${{ github.actor }} pushed the tag. The workflow deleted the tag and the release
+          object, and no deployment ran.
+
+          Cut each release tag on \`main\`, annotated, with the form \`vMAJOR.MINOR.PATCH\`:
+
+          \`\`\`
+          git checkout main && git pull
+          git tag -a $TAG -m 'release $TAG'
+          git push origin $TAG
+          \`\`\`
+
+          The Releases page on GitHub makes a lightweight tag, so it cannot cut a release
+          tag. Rule T-2 needs an annotated tag, and \`git tag -a\` makes one.
+
+          See \`docs/BRANCH_RELEASE_STANDARD.md\`, rules T-1, T-2 and T-3." || true
+
+  deploy:
+    name: deploy to production
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag source branch again at deploy time
+        run: |
+          chmod +x scripts/verify-tag-source.sh
+          scripts/verify-tag-source.sh "${{ github.ref_name }}" main
+
+      - name: Deploy
+        run: |
+          chmod +x scripts/deploy.sh
+          scripts/deploy.sh "${{ github.ref_name }}"
+
+      - name: Post-deploy money-path outcome check
+        run: |
+          chmod +x scripts/post-deploy-check.sh
+          scripts/post-deploy-check.sh

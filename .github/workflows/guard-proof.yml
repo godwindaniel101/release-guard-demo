@@ -1,0 +1,32 @@
+# The guard proof — the harness runs as a check.
+#
+# `scripts/prove-guard.sh` builds a scratch repository and asserts eight cases against
+# the guard. Without this workflow, the harness runs only when a person remembers to run
+# it, and a change to the guard can reach `main` with no case behind it. A pull request
+# into `dev` had no check at all before this workflow.
+#
+# The workflow needs no token and touches nothing outside the runner.
+
+name: guard proof
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    name: the guard proof passes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the guard refuses a shallow clone
+
+      - name: Run the eight cases
+        run: |
+          chmod +x scripts/prove-guard.sh scripts/verify-tag-source.sh
+          scripts/prove-guard.sh

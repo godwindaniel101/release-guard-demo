@@ -1,0 +1,134 @@
+# Guard 2 — the integrity of main. This is a second layer of defence.
+#
+# The PR source guard runs on a pull request event only. A direct push to main, and a
+# merge that an administrator forces, do not start it. This workflow runs on each push
+# to main, and it checks the source of the work after the event.
+#
+# This workflow cannot stop a merge. Branch protection is the only control that stops a
+# merge. This workflow makes the merge loud, and it fails the branch. A person cannot
+# miss the condition.
+
+name: main integrity
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify-provenance:
+    name: main contains only promoted work
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify HEAD arrived via the promotion path
+        id: check
+        run: |
+          set +e
+          git fetch --quiet origin dev '+refs/heads/hotfix/*:refs/remotes/origin/hotfix/*' 2>/dev/null
+
+          HEAD_SHA=$(git rev-parse HEAD)
+          PARENTS=$(git rev-list --parents -n 1 HEAD | cut -d' ' -f2-)
+          NPARENTS=$(echo "$PARENTS" | wc -w)
+          echo "head=$HEAD_SHA parents=$NPARENTS"
+
+          contained_in_dev() { git merge-base --is-ancestor "$1" origin/dev 2>/dev/null; }
+          contained_in_hotfix() {
+            for b in $(git branch -r --list 'origin/hotfix/*' 2>/dev/null); do
+              git merge-base --is-ancestor "$1" "$b" 2>/dev/null && return 0
+            done
+            return 1
+          }
+
+          if [ "$NPARENTS" -lt 2 ]; then
+            # Not a merge commit: acceptable only if the commit itself is on dev.
+            if contained_in_dev "$HEAD_SHA"; then
+              echo "::notice::HEAD is contained in dev."
+              exit 0
+            fi
+            echo "reason=Direct commit on main that is not contained in dev" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          SECOND_PARENT=$(echo "$PARENTS" | cut -d' ' -f2)
+          if contained_in_dev "$SECOND_PARENT"; then
+            # This covers a merge from dev, and a hotfix that a person merged back into
+            # dev already. Both are correct states, so the check reports and stops here.
+            echo "::notice::dev holds the merged work — permitted."
+            exit 0
+          fi
+          if contained_in_hotfix "$SECOND_PARENT"; then
+            # Rule P-2. A hotfix goes from `main` straight to production, and it skips
+            # `dev`. If no person merges it back into `dev`, the next promotion of `dev`
+            # into `main` removes the fix, and the production bug comes back with a merge
+            # that looks correct.
+            #
+            # This is a warning, not a failure. The back-merge happens after the release,
+            # so a failure at this moment would be wrong.
+            if contained_in_dev "$SECOND_PARENT"; then
+              echo "::notice::Merge from a hotfix branch. dev already holds the fix."
+              exit 0
+            fi
+            echo "::warning::Merge from a hotfix branch, and dev does not hold the fix yet."
+            echo "hotfix=$SECOND_PARENT" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SRC=$(git branch -r --contains "$SECOND_PARENT" 2>/dev/null | tr -d ' ' | paste -sd, -)
+          echo "reason=Merged commit $SECOND_PARENT is not contained in dev (found on: ${SRC:-unknown})" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Raise an issue for the hotfix back-merge (rule P-2)
+        if: success() && steps.check.outputs.hotfix != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOTFIX: ${{ steps.check.outputs.hotfix }}
+        run: |
+          gh issue create \
+            --title "Back-merge to dev is necessary: hotfix $(git rev-parse --short "$HOTFIX")" \
+            --body "A hotfix reached \`main\`, and \`dev\` does not hold it.
+
+          **Hotfix commit:** \`$HOTFIX\`
+          **Merge on main:** ${{ github.sha }}
+
+          Merge \`main\` back into \`dev\` now:
+
+          \`\`\`
+          git checkout dev && git pull
+          git merge origin/main
+          git push origin dev
+          \`\`\`
+
+          If you do not, the next promotion of \`dev\` into \`main\` removes this fix, and the
+          production bug comes back with a merge that looks correct. See rule P-2 in
+          \`docs/BRANCH_RELEASE_STANDARD.md\`.
+
+          Close this issue after the back-merge." \
+            || echo "::warning::Could not create the issue (permissions)."
+
+      - name: Raise an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REASON: ${{ steps.check.outputs.reason }}
+        run: |
+          gh issue create \
+            --title "main integrity violation: $(git rev-parse --short HEAD)" \
+            --label "release-guard" \
+            --body "Work reached \`main\` outside the promotion path.
+
+          **Commit:** ${{ github.sha }}
+          **Pushed by:** ${{ github.actor }}
+          **Reason:** $REASON
+
+          \`main\` accepts \`dev\` and \`hotfix/*\` only. See \`docs/BRANCH_RELEASE_STANDARD.md\`.
+
+          This workflow detects but cannot prevent. Prevention requires the branch protection
+          settings in section 6 of the standard — run \`scripts/apply-branch-protection.sh\`." \
+            || echo "::warning::Could not create issue (labels or permissions)."
